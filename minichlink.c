@@ -61,7 +61,7 @@ void *MiniCHLinkInitAsDLL(struct MiniChlinkFunctions **MCFO, const init_hints_t 
 
     if (!dev) {
         fprintf(stderr, "Error: Could not initialize any supported programmers\n");
-        return 0;
+        return NULL;
     }
 
     struct InternalState *iss = calloc(1, sizeof(struct InternalState));
@@ -80,15 +80,16 @@ void *MiniCHLinkInitAsDLL(struct MiniChlinkFunctions **MCFO, const init_hints_t 
     }
     return dev;
 }
-#undef main
 
 #if !defined(MINICHLINK_AS_LIBRARY) && !defined(MINICHLINK_IMPORT)
 int main(int argc, char **argv) {
     int i;
 
-    if (argc > 1 && argv[1][0] == '-' && argv[1][1] == 'h') {
+    if (argc==1)
         goto help;
-    }
+    //if (argc > 1 && argv[1][0] == '-' && argv[1][1] == 'h') {
+    //    goto help;
+    //}
     init_hints_t hints;
     memset(&hints, 0, sizeof(hints));
 
@@ -102,11 +103,18 @@ int main(int argc, char **argv) {
             i++;
             if (i < argc) hints.specific_programmer = argv[i];
         }
+        else if ((strncmp(v, "--help", 6) == 0)
+		         || (strncmp(v,"-?",2)==0)
+		         || (strncmp(v,"--?",3)==0)
+		        )
+		{
+			goto help;
+		}
     }
 
     void *dev = MiniCHLinkInitAsDLL(0, &hints);
     if (!dev) {
-        fprintf(stderr, "Error: Could not initialize any supported programmers\n");
+        //fprintf(stderr, "2Error: Could not initialize any supported programmers\n");
         return -32;
     }
 
@@ -152,15 +160,15 @@ int main(int argc, char **argv) {
 
                 iarg += 1;
                 if (iarg >= argc) {
-                    fprintf(stderr, "-K <KB Ram> command requires an argument of 32/64/128/192 \n\n");
+                    fprintf(stderr, "-K <KB Ram> command requires an argument of 32/64/96/128/192 \n\n");
                     goto help;
                 }
 
                 iss->wanted_ram_split = SimpleReadNumberInt(argv[iarg], -1);
 
                 if (!((iss->wanted_ram_split == 32) || (iss->wanted_ram_split == 64) ||
-                      (iss->wanted_ram_split == 128) || (iss->wanted_ram_split == 192))) {
-                    fprintf(stderr, "-K <KB Ram> - Valid arguments are 32/64/128/192 \n\n");
+                       (iss->wanted_ram_split == 96) || (iss->wanted_ram_split == 128) || (iss->wanted_ram_split == 192))) {
+                    fprintf(stderr, "-K <KB Ram> - Valid arguments are 32/64/96/128/192 \n\n");
                     goto help;
                 }
             } break;
@@ -590,7 +598,7 @@ help:
     fprintf(stderr, " -A Go into Halt without reboot\n");
     fprintf(stderr, " -D Configure NRST as GPIO\n");
     fprintf(stderr, " -d Configure NRST as NRST\n");
-    fprintf(stderr, " -K [KB Ram] - SET CH307 KB Ram assigned on Boot - Valid arguments 32 / 64 / 128 / 192 \n");
+    fprintf(stderr, " -K [KB Ram] - SET CH307 KB Ram assigned on Boot - Valid arguments 32 / 64 / 96 / 128 / 192 \n");
     fprintf(stderr, " -i Show chip info\n");
     fprintf(stderr, " -s [debug register] [value]\n");
     fprintf(stderr, " -m [debug register]\n");
