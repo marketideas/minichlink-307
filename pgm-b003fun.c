@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "ch32v003fun/ch32v003fun.h"
+#include "ch32v003fun.h"
 #include "hidapi.h"
 #include "minichlink.h"
 

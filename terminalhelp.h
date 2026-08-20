@@ -82,7 +82,7 @@ static int ReadKBByte() {
 #include <sys/time.h>
 #include <unistd.h>
 
-static void CtrlC() {
+static void CtrlC(int res) {
     fprintf(stderr, "Minichlink Closing\n");
     ResetKeyboardInput();
     exit(0);

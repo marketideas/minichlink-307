@@ -12450,7 +12450,7 @@ void DefaultIRQHandler( void ) __attribute__((section(".text.vector_handler"))) 
 void DelaySysTick( uint32_t n );
 
 // Tricky: We need to make sure main and SystemInit() are preserved.
-int main() __attribute__((used));
+//int main() __attribute__((used));
 void SystemInit(void);
 
 #ifdef FUNCONF_UART_PRINTF_BAUD

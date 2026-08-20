@@ -12,7 +12,7 @@
 #include "minichlink.h"
 #include "terminalhelp.h"
 
-#include "ch32v003fun/ch32v003fun.h"
+#include "ch32v003fun.h"
 
 
 #if defined(WINDOWS) || defined(WIN32) || defined(_WIN32)
@@ -80,6 +80,7 @@ void *MiniCHLinkInitAsDLL(struct MiniChlinkFunctions **MCFO, const init_hints_t 
     }
     return dev;
 }
+#undef main
 
 #if !defined(MINICHLINK_AS_LIBRARY) && !defined(MINICHLINK_IMPORT)
 int main(int argc, char **argv) {
