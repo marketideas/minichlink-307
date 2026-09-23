@@ -120,6 +120,60 @@ int main(int argc, char **argv) {
 
     int status;
     int must_be_end = 0;
+    struct InternalState *iss = (struct InternalState *)(((struct ProgrammerStructBase *)dev)->internal);
+
+    /* -i and -S must not pulse NRST. -S is the SWD-pin test. */
+    {
+        int only_i = 1;
+        int only_s = 1;
+        for (int a = 1; a < argc; a++) {
+            if (argv[a][0] != '-' || argv[a][1] == '\0') {
+                only_i = 0;
+                only_s = 0;
+                break;
+            }
+            for (const char *p = argv[a] + 1; *p; p++) {
+                if (*p != 'i')
+                    only_i = 0;
+                if (*p != 'S')
+                    only_s = 0;
+            }
+        }
+        iss->no_attach_reset = only_i || only_s;
+        iss->swd_probe = only_s;
+        /* -R must not take the debug halt. With readout protection that
+         * halt survives disconnect until the board loses power. */
+        {
+            int only_r = 1;
+            for (int a = 1; a < argc; a++) {
+                if (argv[a][0] != '-' || argv[a][1] == '\0') {
+                    only_r = 0;
+                    break;
+                }
+                for (const char *p = argv[a] + 1; *p; p++) {
+                    if (*p != 'R')
+                        only_r = 0;
+                }
+            }
+            if (only_r)
+                iss->hardware_reset = 1;
+            {
+                int only_p = 1;
+                for (int a = 1; a < argc; a++) {
+                    if (argv[a][0] != '-' || argv[a][1] == '\0') {
+                        only_p = 0;
+                        break;
+                    }
+                    for (const char *p = argv[a] + 1; *p; p++) {
+                        if (*p != 'P')
+                            only_p = 0;
+                    }
+                }
+                if (only_p)
+                    iss->protect_run = 1;
+            }
+        }
+    }
 
     int skip_startup =
         (argc > 1 && argv[1][0] == '-' && argv[1][1] == 'u') | (argc > 1 && argv[1][0] == '-' && argv[1][1] == 'h') |
@@ -128,7 +182,9 @@ int main(int argc, char **argv) {
 
     if (!skip_startup && MCF.SetupInterface) {
         if (MCF.SetupInterface(dev) < 0) {
-            fprintf(stderr, "Could not setup interface.\n");
+            if (!iss->no_attach_reset)
+                fprintf(stderr, "Could not setup interface.\n");
+            if (MCF.Exit) MCF.Exit(dev);
             return -33;
         }
         printf("Interface Setup\n");
@@ -219,6 +275,14 @@ int main(int argc, char **argv) {
                 break;
             case 'b': // reBoot
                 if (!MCF.HaltMode || MCF.HaltMode(dev, HALT_MODE_REBOOT)) goto unimplemented;
+                iss->release_from_reset = 1;
+                break;
+            case 'R': // Pin reset only. Debug resume does not run a
+                      // readout-protected core, and leaving haltreq set
+                      // sticks until power is cycled.
+                fprintf(stderr, "Hardware reset\n");
+                iss->hardware_reset = 1;
+                iss->skip_debug_on_exit = 1;
                 break;
             case 'B': // reBoot into Bootloader
                 if (!MCF.HaltMode || MCF.HaltMode(dev, HALT_MODE_GO_TO_BOOTLOADER)) goto unimplemented;
@@ -254,17 +318,30 @@ int main(int argc, char **argv) {
                 break;
             case 'p':
                 if (MCF.HaltMode) MCF.HaltMode(dev, HALT_MODE_HALT_AND_RESET);
-                if (MCF.ConfigureReadProtection)
-                    MCF.ConfigureReadProtection(dev, 0);
-                else
-                    goto unimplemented;
+                if (!MCF.ConfigureReadProtection || MCF.ConfigureReadProtection(dev, 0)) {
+                    fprintf(stderr, "Error: could not disable read protection\n");
+                    return -1;
+                }
+                iss->release_from_reset = 1;
                 break;
             case 'P':
-                if (MCF.HaltMode) MCF.HaltMode(dev, HALT_MODE_HALT_AND_RESET);
-                if (MCF.ConfigureReadProtection)
-                    MCF.ConfigureReadProtection(dev, 1);
-                else
-                    goto unimplemented;
+                if (iss->leave_running) {
+                    fprintf(stderr, "SWD is off. Left the running chip alone.\n");
+                    break;
+                }
+                if (iss->read_protected) {
+                    fprintf(stderr, "Read protection already enabled. Not resetting.\n");
+                    iss->leave_running = 1;
+                    break;
+                }
+                /* Do not use -b here. Its ndmreset loads readout protection
+                 * while the debugger is still attached, so the core halts
+                 * out of reset and cannot be resumed. */
+                if (!MCF.ConfigureReadProtection || MCF.ConfigureReadProtection(dev, 1)) {
+                    fprintf(stderr, "Error: could not enable read protection\n");
+                    return -1;
+                }
+                iss->pin_reset_after_detach = 1;
                 break;
             case 'G':
             case 'T': {
@@ -385,6 +462,13 @@ int main(int argc, char **argv) {
                     goto unimplemented;
                 break;
             }
+            case 'S': /* Live SWD only. Setup already failed if the pins were silent. */
+                printf("SWD connected\n");
+                if (MCF.PrintChipInfo)
+                    MCF.PrintChipInfo(dev);
+                else
+                    goto unimplemented;
+                break;
             case 'X': {
                 iarg++;
                 if (iarg >= argc) {
@@ -593,13 +677,15 @@ help:
     fprintf(stderr, " -u Clear all code flash - by power off (also can unbrick)\n");
     fprintf(stderr, " -E Erase chip\n");
     fprintf(stderr, " -b Reboot out of Halt\n");
+    fprintf(stderr, " -R Release halts, then hardware reset (NRST). Forces attach if the first try fails\n");
     fprintf(stderr, " -e Resume from halt\n");
     fprintf(stderr, " -a Reboot into Halt\n");
     fprintf(stderr, " -A Go into Halt without reboot\n");
     fprintf(stderr, " -D Configure NRST as GPIO\n");
     fprintf(stderr, " -d Configure NRST as NRST\n");
     fprintf(stderr, " -K [KB Ram] - SET CH307 KB Ram assigned on Boot - Valid arguments 32 / 64 / 96 / 128 / 192 \n");
-    fprintf(stderr, " -i Show chip info\n");
+    fprintf(stderr, " -i Show chip info (does not reset if SWD is off)\n");
+    fprintf(stderr, " -S Probe live SWD pins and show chip info. Fails, without reset, if they do not answer\n");
     fprintf(stderr, " -s [debug register] [value]\n");
     fprintf(stderr, " -m [debug register]\n");
     fprintf(stderr, " -T Terminal Only\n");
@@ -1542,10 +1628,20 @@ static int DefaultHaltMode(void *dev, int mode) {
             MCF.FlushLLCommands(dev);
             break;
         case HALT_MODE_REBOOT:
-            MCF.WriteReg32(dev, DMCONTROL, 0x80000001); // Make the debug module work properly.
-            MCF.WriteReg32(dev, DMCONTROL, 0x80000001); // Initiate a halt request.
-            MCF.WriteReg32(dev, DMCONTROL, 0x80000003); // Reboot.
+            /* haltreq during ndmreset parks the hart on the way out, and
+             * resumereq in that same write is ignored. The core then stays
+             * halted until power is cycled. Reset with haltreq clear, then
+             * resume only if it parked. */
+            MCF.WriteReg32(dev, DMCONTROL, 0x00000003); // dmactive | ndmreset
+            MCF.FlushLLCommands(dev);
+            MCF.DelayUS(dev, 10000);
+            MCF.WriteReg32(dev, DMCONTROL, 0x00000001); // release ndmreset
+            MCF.FlushLLCommands(dev);
+            MCF.DelayUS(dev, 5000);
             MCF.WriteReg32(dev, DMCONTROL, 0x40000001); // resumereq
+            MCF.FlushLLCommands(dev);
+            MCF.DelayUS(dev, 2000);
+            MCF.WriteReg32(dev, DMCONTROL, 0x00000001);
             MCF.FlushLLCommands(dev);
             break;
         case HALT_MODE_RESUME:

@@ -124,6 +124,29 @@ sendfail:
 	exit(status);
 }
 
+/* Like wch_link_command, but returns the libusb status instead of exiting. */
+static int wch_link_command_try(
+    libusb_device_handle *devh, const void *command_v, int commandlen, int *transferred, uint8_t *reply, int replymax
+)
+{
+	uint8_t *command = (uint8_t *)command_v;
+	uint8_t buffer[1024];
+	int status;
+	int transferred_local;
+	if (!transferred)
+		transferred = &transferred_local;
+	status = libusb_bulk_transfer(devh, 0x01, command, commandlen, transferred, WCHTIMEOUT);
+	if (status)
+		return status;
+	if (!reply)
+	{
+		reply = buffer;
+		replymax = sizeof(buffer);
+	}
+	status = libusb_bulk_transfer(devh, 0x81, reply, replymax, transferred, WCHTIMEOUT);
+	return status;
+}
+
 static void wch_link_multicommands(libusb_device_handle *devh, int nrcommands, ...)
 {
 	int i;
@@ -332,8 +355,19 @@ static int LESetupInterface(void *d)
 	uint8_t rbuff[1024];
 	uint32_t transferred = 0;
 
-	// This puts the processor on hold to allow the debugger to run.
-	wch_link_command(dev, "\x81\x0d\x01\x03", 4, (int *)&transferred, rbuff, 1024); // Reply: Ignored, 820d050900300500
+	/* A pin reset must not connect. The failed 0x02 on a protected,
+	 * running part takes a debug hold that survives until power is cycled. */
+	if (iss->hardware_reset)
+	{
+		fprintf(stderr, "NRST reset only; not attaching\n");
+		iss->skip_debug_on_exit = 1;
+		return 0;
+	}
+
+	/* 0x03 is the debug hold. On a protected part it survives 0xff until
+	 * power is cycled, so a pin reset must not take it. */
+	if (!iss->avoid_debug_hold)
+		wch_link_command(dev, "\x81\x0d\x01\x03", 4, (int *)&transferred, rbuff, 1024);
 
 	// Place part into reset.
 	wch_link_command(
@@ -380,6 +414,54 @@ static int LESetupInterface(void *d)
 			// The following code may try to execute a few times to get the processor to actually reset.
 			// This code could likely be much better.
 
+			/* SWD is off because the protected image is running. The
+			 * hold-and-retry below parks the hart, and 0xff then leaves
+			 * that park until power is cycled. A reset only pulses NRST. */
+			if (iss->hardware_reset)
+			{
+				fprintf(stderr, "SWD is off. Pulsing NRST without attaching.\n");
+				iss->skip_debug_on_exit = 1;
+				return 0;
+			}
+
+			/* Protected firmware has turned SWD off and is running.
+			 * The hold-and-retry below would park it until power is cycled. */
+			if (iss->protect_run)
+			{
+				fprintf(stderr, "SWD is off. Chip is running; not breaking in.\n");
+				iss->leave_running = 1;
+				return 0;
+			}
+
+			if (iss->no_attach_reset)
+			{
+				if (iss->swd_probe)
+				{
+					fprintf(
+					    stderr,
+					    "SWD did not respond (%d = [%02x %02x %02x %02x]). Attach failed; the part was not reset.\n",
+					    transferred, rbuff[0], rbuff[1], rbuff[2], rbuff[3]
+					);
+				}
+				else
+				{
+					uint8_t prbuf[16];
+					int pn = 0;
+					fprintf(
+					    stderr,
+					    "SWD not connected (%d = [%02x %02x %02x %02x]). Not resetting the part.\n",
+					    transferred, rbuff[0], rbuff[1], rbuff[2], rbuff[3]
+					);
+					if (wch_link_command_try(dev, "\x81\x06\x01\x01", 4, &pn, prbuf, sizeof(prbuf)) == 0 && pn >= 4)
+					{
+						fprintf(stderr, "Read protection: %s\n", prbuf[3] == 0x01 ? "enabled" : "disabled");
+					}
+					fprintf(stderr, "Status does not break in over reset.\n");
+				}
+				iss->skip_debug_on_exit = 1;
+				return -1;
+			}
+
 			fprintf(
 			    stderr,
 			    "link error, nothing connected to linker (%d = [%02x %02x %02x %02x]).  Trying to put processor in "
@@ -387,28 +469,20 @@ static int LESetupInterface(void *d)
 			    transferred, rbuff[0], rbuff[1], rbuff[2], rbuff[3]
 			);
 
-			// Give up if too long
-			if (already_tried_reset > 10)
+			/* 0x03 (debug hold) survives a failed attach and the hart
+			 * stays stopped until power is cycled. Pulse NRST only. */
+			if (already_tried_reset >= 4)
 			{
+				fprintf(stderr,
+				        "Could not attach (read protection, or SWD turned off after reset). "
+				        "Releasing reset.\n");
 				return -1;
 			}
 
 			wch_link_multicommands(
 			    (libusb_device_handle *)dev, 1, 4, "\x81\x0d\x01\x13"
 			); // Try forcing reset line low.
-			wch_link_command((libusb_device_handle *)dev, "\x81\x0d\x01\xff", 4, 0, 0, 0); // Exit programming
-
-			if (already_tried_reset > 3)
-			{
-				MCF.DelayUS(iss, 5000);
-				wch_link_command(
-				    dev, "\x81\x0d\x01\x03", 4, (int *)&transferred, rbuff, 1024
-				); // Reply: Ignored, 820d050900300500
-			}
-			else
-			{
-				MCF.DelayUS(iss, 5000);
-			}
+			MCF.DelayUS(iss, 5000);
 
 			wch_link_multicommands((libusb_device_handle *)dev, 1, 4, "\x81\x0d\x01\x14"); // Release reset line.
 			wch_link_multicommands(
@@ -440,9 +514,10 @@ static int LESetupInterface(void *d)
 
 		iss->sector_size = 256;
 
-		wch_link_command(
-		    dev, "\x81\x0d\x01\x03", 4, (int *)&transferred, rbuff, 1024
-		); // Reply: Ignored, 820d050900300500
+		if (!iss->hardware_reset && !iss->avoid_debug_hold)
+			wch_link_command(
+			    dev, "\x81\x0d\x01\x03", 4, (int *)&transferred, rbuff, 1024
+			);
 	}
 	else if (result < 0)
 	{
@@ -452,23 +527,33 @@ static int LESetupInterface(void *d)
 
 	iss->target_chip_type = chip;
 
-	// For some reason, if we don't do this sometimes the programmer starts in a hosey mode.
-	MCF.WriteReg32(d, DMCONTROL, 0x80000001); // Make the debug module work properly.
-	MCF.WriteReg32(d, DMCONTROL, 0x80000001); // Initiate a halt request.
-	MCF.WriteReg32(d, DMCONTROL, 0x80000001); // No, really make sure.
-	MCF.WriteReg32(d, DMABSTRACTCS, 0x00000700); // Ignore any pending errors.
-	MCF.WriteReg32(d, DMABSTRACTAUTO, 0);
-	MCF.WriteReg32(d, DMCOMMAND, 0x00221000); // Read x0 (Null command) with nopostexec (to fix v307 read issues)
-
-	int r = 0;
-
-	r |= MCF.WaitForDoneOp(d, 0);
-	if (r)
+	/* haltreq here is what sticks across disconnect when readout
+	 * protection is on. A hardware reset must not set it. */
+	if (!iss->hardware_reset && !iss->avoid_debug_hold)
 	{
-		fprintf(stderr, "Fault on setup\n");
+		// For some reason, if we don't do this sometimes the programmer starts in a hosey mode.
+		MCF.WriteReg32(d, DMCONTROL, 0x80000001); // Make the debug module work properly.
+		MCF.WriteReg32(d, DMCONTROL, 0x80000001); // Initiate a halt request.
+		MCF.WriteReg32(d, DMCONTROL, 0x80000001); // No, really make sure.
+		MCF.WriteReg32(d, DMABSTRACTCS, 0x00000700); // Ignore any pending errors.
+		MCF.WriteReg32(d, DMABSTRACTAUTO, 0);
+		MCF.WriteReg32(d, DMCOMMAND, 0x00221000); // Read x0 (Null command) with nopostexec (to fix v307 read issues)
+
+		int r = 0;
+
+		r |= MCF.WaitForDoneOp(d, 0);
+		if (r)
+		{
+			fprintf(stderr, "Fault on setup\n");
+		}
+		else
+		{
+			fprintf(stderr, "Setup success\n");
+		}
 	}
 	else
 	{
+		iss->reset_attached = 1;
 		fprintf(stderr, "Setup success\n");
 	}
 
@@ -503,6 +588,7 @@ static int LESetupInterface(void *d)
 
 	if (rbuff[3] == 0x01)
 	{
+		iss->read_protected = 1;
 		fprintf(stderr, "Read protection: enabled\n");
 	}
 	else
@@ -580,15 +666,128 @@ static int LEConfigureReadProtection(void *d, int one_if_yes_protect)
 
 	if (one_if_yes_protect)
 	{
-		wch_link_multicommands(
-		    (libusb_device_handle *)dev, 2, 11, "\x81\x06\x08\x03\xf7\xff\xff\xff\xff\xff\xff", 4, "\x81\x0b\x01\x01"
-		);
+		uint8_t rbuff[64];
+		int transferred = 0;
+		int status;
+		uint8_t user = 0x7f; /* 96K split, if the option word cannot be read */
+		uint32_t opt = 0;
+
+		/* USER is the low byte of the high halfword at 0x1FFFF800.
+		 * Keep it: the old 0xf7 write replaced the RAM split. */
+		if (MCF.ReadWord && MCF.ReadWord(d, 0x1FFFF800, &opt) == 0)
+			user = (uint8_t)((opt >> 16) & 0xff);
+
+		fprintf(stderr, "Enabling read protection (USER=0x%02x)\n", user);
+
+		/* 0x06/0x01/0x03 is acked by LinkE 2.22 and leaves the flag at
+		 * 0x02. The option-byte write is what programs readout protection.
+		 * Do it on a fresh attach while the hart is still halted, then
+		 * quit-reset so the new option byte is loaded before the check. */
+		if (wch_link_command_try(dev, "\x81\x0d\x01\xff", 4, 0, 0, 0) ||
+		    wch_link_command_try(dev, "\x81\x0d\x01\x02", 4, 0, 0, 0))
+		{
+			fprintf(stderr, "Error: could not reattach before protect\n");
+			wch_link_command_try(dev, "\x81\x0d\x01\x02", 4, 0, 0, 0);
+			return -1;
+		}
+
+		wch_link_command_try(dev, "\x81\x11\x01\x09", 4, 0, 0, 0);
+		{
+			uint8_t cmd[11] = {0x81, 0x06, 0x08, 0x03, user, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+			status = wch_link_command_try(dev, cmd, sizeof(cmd), &transferred, rbuff, sizeof(rbuff));
+		}
+		if (status)
+		{
+			fprintf(stderr, "Error: protect command failed (%d)\n", status);
+			wch_link_command_try(dev, "\x81\x0d\x01\x02", 4, 0, 0, 0);
+			return -1;
+		}
+		/* Release the hart before any reset. Readout protection is not
+		 * active until that reset, so this resume still works. */
+		if (MCF.WriteReg32)
+		{
+			fprintf(stderr, "Releasing halt before disconnect\n");
+			MCF.WriteReg32(d, DMCONTROL, 0x00000001);
+			MCF.WriteReg32(d, DMCONTROL, 0x40000001);
+			if (MCF.DelayUS)
+				MCF.DelayUS(d, 50000);
+			MCF.WriteReg32(d, DMCONTROL, 0x00000001);
+		}
+		fprintf(stderr, "Read protection programmed\n");
 	}
 	else
 	{
-		wch_link_multicommands(
-		    (libusb_device_handle *)dev, 2, 11, "\x81\x06\x08\x02\xf7\xff\xff\xff\xff\xff\xff", 4, "\x81\x0b\x01\x01"
-		);
+		struct InternalState *iss = (struct InternalState *)(((struct ProgrammerStructBase *)d)->internal);
+		uint8_t rbuff[64];
+		int transferred = 0;
+		int status;
+		uint8_t user = 0x7f;
+
+		/* -K sets this. 0xf7 is not a RAM-split byte, so the old write
+		 * never cleared RDPR. */
+		switch (iss->wanted_ram_split)
+		{
+		case 32: user = 0xff; break;
+		case 64: user = 0xbf; break;
+		case 96: user = 0x7f; break;
+		case 128: user = 0x3f; break;
+		case 192: user = 0xdf; break;
+		default: break;
+		}
+
+		fprintf(stderr, "Disabling read protection (USER=0x%02x). This mass-erases application flash.\n", user);
+
+		if (wch_link_command_try(dev, "\x81\x0d\x01\xff", 4, 0, 0, 0) ||
+		    wch_link_command_try(dev, "\x81\x0d\x01\x02", 4, 0, 0, 0))
+		{
+			fprintf(stderr, "Error: could not reattach before unprotect\n");
+			wch_link_command_try(dev, "\x81\x0d\x01\x02", 4, 0, 0, 0);
+			return -1;
+		}
+
+		/* Short 0x02 is "set read-unprotected". The 11-byte form keeps USER. */
+		status = wch_link_command_try(dev, "\x81\x06\x01\x02", 4, &transferred, rbuff, sizeof(rbuff));
+		if (!status)
+		{
+			wch_link_command_try(dev, "\x81\x0b\x01\x01", 4, 0, 0, 0);
+			if (MCF.DelayUS)
+				MCF.DelayUS(d, 300000);
+		}
+		if (wch_link_command_try(dev, "\x81\x0d\x01\xff", 4, 0, 0, 0) ||
+		    wch_link_command_try(dev, "\x81\x0d\x01\x02", 4, 0, 0, 0) ||
+		    wch_link_command_try(dev, "\x81\x06\x01\x01", 4, &transferred, rbuff, sizeof(rbuff)) ||
+		    transferred < 4 || rbuff[3] == 0x01)
+		{
+			uint8_t cmd[11] = {0x81, 0x06, 0x08, 0x02, user, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+			fprintf(stderr, "Short unprotect left protection enabled, trying option-byte form\n");
+			status = wch_link_command_try(dev, cmd, sizeof(cmd), &transferred, rbuff, sizeof(rbuff));
+			if (status)
+			{
+				fprintf(stderr, "Error: unprotect command failed (%d)\n", status);
+				return -1;
+			}
+			if (wch_link_command_try(dev, "\x81\x0b\x01\x01", 4, 0, 0, 0))
+			{
+				fprintf(stderr, "Error: quit-reset after unprotect failed\n");
+				return -1;
+			}
+			if (MCF.DelayUS)
+				MCF.DelayUS(d, 300000);
+			if (wch_link_command_try(dev, "\x81\x0d\x01\xff", 4, 0, 0, 0) ||
+			    wch_link_command_try(dev, "\x81\x0d\x01\x02", 4, 0, 0, 0) ||
+			    wch_link_command_try(dev, "\x81\x06\x01\x01", 4, &transferred, rbuff, sizeof(rbuff)) ||
+			    transferred < 4)
+			{
+				fprintf(stderr, "Error: could not re-read protection status\n");
+				return -1;
+			}
+		}
+		if (rbuff[3] == 0x01)
+		{
+			fprintf(stderr, "Error: readout protection is still enabled\n");
+			return -1;
+		}
+		fprintf(stderr, "Read protection: disabled\n");
 	}
 	return 0;
 }
@@ -596,7 +795,70 @@ static int LEConfigureReadProtection(void *d, int one_if_yes_protect)
 int LEExit(void *d)
 {
 	libusb_device_handle *dev = ((struct LinkEProgrammerStruct *)d)->devh;
+	struct InternalState *iss = (struct InternalState *)(((struct ProgrammerStructBase *)d)->internal);
 
+	if (iss && iss->leave_running)
+		return 0;
+
+	/* make protect only. Debugger is dropped while the hart is running
+	 * and readout protection is not latched yet. The pin pulse then
+	 * loads the option byte with no debug hold in place. */
+	if (iss && iss->pin_reset_after_detach)
+	{
+		fprintf(stderr, "Ending debug session\n");
+		wch_link_command((libusb_device_handle *)dev, "\x81\x0d\x01\xff", 4, 0, 0, 0);
+		if (MCF.DelayUS)
+			MCF.DelayUS(d, 50000);
+		fprintf(stderr, "Pulsing NRST\n");
+		wch_link_command((libusb_device_handle *)dev, "\x81\x0d\x01\x13", 4, 0, 0, 0);
+		if (MCF.DelayUS)
+			MCF.DelayUS(d, 50000);
+		wch_link_command((libusb_device_handle *)dev, "\x81\x0d\x01\x14", 4, 0, 0, 0);
+		if (MCF.DelayUS)
+			MCF.DelayUS(d, 50000);
+		return 0;
+	}
+
+	/* make reset only. Never attached. Pin pulse, nothing else. */
+	if (iss && iss->hardware_reset)
+	{
+		fprintf(stderr, "Pulsing NRST\n");
+		wch_link_command((libusb_device_handle *)dev, "\x81\x0d\x01\x14", 4, 0, 0, 0);
+		if (MCF.DelayUS)
+			MCF.DelayUS(d, 20000);
+		wch_link_command((libusb_device_handle *)dev, "\x81\x0d\x01\x13", 4, 0, 0, 0);
+		if (MCF.DelayUS)
+			MCF.DelayUS(d, 50000);
+		wch_link_command((libusb_device_handle *)dev, "\x81\x0d\x01\x14", 4, 0, 0, 0);
+		if (MCF.DelayUS)
+			MCF.DelayUS(d, 50000);
+		return 0;
+	}
+
+	/* Reset (-b) and protect (-P) quit reset before disconnect. After -P
+	 * the debug module is locked, so a DMI resume cannot clear the hold. */
+	if (iss && iss->release_from_reset)
+	{
+		fprintf(stderr, "Releasing processor from reset\n");
+		if (!(iss->skip_debug_on_exit) && MCF.WriteReg32)
+		{
+			MCF.WriteReg32(d, DMCONTROL, 0x00000001); /* dmactive; ndmreset and haltreq clear */
+		}
+		/* WCH quit-reset (0x0b/0x01). The probe finishes releasing NRST during this delay. */
+		wch_link_command((libusb_device_handle *)dev, "\x81\x0b\x01\x01", 4, 0, 0, 0);
+		if (MCF.DelayUS)
+		{
+			MCF.DelayUS(d, 300000);
+		}
+	}
+
+	wch_link_command((libusb_device_handle *)dev, "\x81\x0d\x01\x14", 4, 0, 0, 0);
+	if (!(iss && iss->skip_debug_on_exit) && MCF.WriteReg32)
+	{
+		MCF.WriteReg32(d, DMCONTROL, 0x00000001); /* dmactive, haltreq clear */
+		MCF.WriteReg32(d, DMCONTROL, 0x40000001); /* resumereq */
+		MCF.WriteReg32(d, DMCONTROL, 0x00000001);
+	}
 	wch_link_command((libusb_device_handle *)dev, "\x81\x0d\x01\xff", 4, 0, 0, 0);
 	return 0;
 }

@@ -120,6 +120,18 @@ struct InternalState {
     uint32_t flash_unlocked;
     int lastwriteflags;
     int processor_in_mode;
+    int release_from_reset; /* -b and -P: drop reset before disconnect */
+    int skip_debug_on_exit; /* -P: readout protection rejects a later DMI resume */
+    int no_attach_reset;    /* -i or -S: do not pulse NRST to break in */
+    int swd_probe;          /* -S: fail if the live SWD pins do not answer */
+    int hardware_reset;     /* -R: clear halts, then pulse NRST and disconnect */
+    int reset_attached;     /* -R connected, so the core can be resumed after NRST */
+    int read_protected;     /* probe reported readout protection during setup */
+    int avoid_debug_hold;   /* -P: do not take the sticky debug halt */
+    int pin_reset_after_detach; /* -P: end debug, then pulse NRST with haltreq clear */
+    int halt_cleared;           /* -P: DMSTATUS showed the hart running before detach */
+    int leave_running;          /* -P saw SWD off: do not break in or reset */
+    int protect_run;            /* -P: do not hold-and-retry if SWD is already off */
     int autoincrement;
     uint32_t ram_base;
     uint32_t ram_size;
