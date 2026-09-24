@@ -172,6 +172,14 @@ int main(int argc, char **argv) {
                 if (only_p)
                     iss->protect_run = 1;
             }
+            for (int a = 1; a < argc; a++) {
+                if (argv[a][0] != '-')
+                    continue;
+                for (const char *p = argv[a] + 1; *p; p++) {
+                    if (*p == 'r')
+                        iss->read_run = 1;
+                }
+            }
         }
     }
 
@@ -480,8 +488,6 @@ int main(int argc, char **argv) {
                 break;
             }
             case 'r': {
-                if (MCF.HaltMode) MCF.HaltMode(dev, HALT_MODE_HALT_BUT_NO_RESET); // No need to reboot.
-
                 if (argchar[2] != 0) {
                     fprintf(stderr, "Error: can't have char after paramter field\n");
                     goto help;
@@ -501,6 +507,51 @@ int main(int argc, char **argv) {
                     return -9;
                 }
 
+                /* Reading protected app flash requires halting the CPU
+                 * first (both the generic DM program-buffer path in
+                 * DefaultReadBinaryBlob/DefaultReadWord, and the
+                 * WCH-LinkE's own native "Memory Read" protocol command,
+                 * per the ch32-rs/wlink reference implementation's
+                 * read_memory(), documented "require MCU to be halted").
+                 * That same reference tool's dump_info() checks read
+                 * protection and, if protected, only logs a warning
+                 * ("Flash is protected, debug access is not available")
+                 * and never proceeds to halt-and-read - it has no code
+                 * path that attempts a memory read against protected
+                 * flash at all, native or otherwise. Empirically on this
+                 * hardware, any halt-and-read attempt against protected
+                 * flash (regardless of which read path is used) wedges
+                 * the part in a way that is not recoverable with
+                 * NRST/ndmreset - only a power-on reset clears it. So
+                 * refuse here too, matching the reference tool's own
+                 * behavior, for any backend. */
+                uint32_t flash_base = 0x08000000;
+                /* When a protected+running chip's attach bails out early
+                 * (SWD off, no reset-line retry attempted - see
+                 * LESetupInterface's read_run branch), iss->flash_size is
+                 * never populated (stays 0). Don't let that shrink the
+                 * protected range to nothing: fall back to a conservative
+                 * upper bound (512KB covers every CH32V30x flash_size
+                 * variant) so the guard still fires. */
+                uint32_t flash_extent = iss->flash_size ? iss->flash_size : (512 * 1024);
+                int hits_protected_flash =
+                    iss->read_protected && offset < (uint64_t)flash_base + (uint64_t)flash_extent &&
+                    offset + amount > (uint64_t)flash_base;
+                if (hits_protected_flash) {
+                    fprintf(
+                        stderr,
+                        "Read protection is enabled and this request overlaps protected app flash "
+                        "(0x%08x-0x%08x). Refusing to halt/read: on this part even halting an already "
+                        "protected chip to read it wedges the debug session in a way that requires a "
+                        "power cycle to recover, and protection status is already confirmed without it. "
+                        "No data read.\n",
+                        flash_base, flash_base + flash_extent
+                    );
+                    iss->leave_running = 1;
+                    iss->read_failed = 1;
+                    goto finish;
+                }
+
                 FILE *f = 0;
                 int hex = 0;
                 if (strcmp(fname, "-") == 0)
@@ -513,12 +564,16 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "Error: can't open write file \"%s\"\n", fname);
                     return -9;
                 }
+
+                if (MCF.HaltMode) MCF.HaltMode(dev, HALT_MODE_HALT_BUT_NO_RESET); // No need to reboot.
+
                 uint8_t *readbuff = malloc(amount);
 
                 if (MCF.ReadBinaryBlob) {
                     if (MCF.ReadBinaryBlob(dev, offset, amount, readbuff) < 0) {
                         fprintf(stderr, "Fault reading device\n");
-                        return -12;
+                        iss->read_failed = 1;
+                        goto finish;
                     }
                 } else {
                     goto unimplemented;
@@ -658,11 +713,12 @@ int main(int argc, char **argv) {
         }
     }
 
+finish:
     if (MCF.FlushLLCommands) MCF.FlushLLCommands(dev);
 
     if (MCF.Exit) MCF.Exit(dev);
 
-    return 0;
+    return iss->read_failed ? -12 : 0;
 
 help:
     fprintf(stderr, "Usage: minichlink [args]\n");
@@ -800,7 +856,10 @@ static int DefaultWaitForDoneOp(void *dev, int ignore) {
 
             uint32_t temp;
             MCF.ReadReg32(dev, DMSTATUS, &temp);
-            fprintf(stderr, "Fault writing memory (DMABSTRACTS = %08x) (%s) DMSTATUS: %08x\n", rrv, errortext, temp);
+            struct InternalState *iss = (struct InternalState *)(((struct ProgrammerStructBase *)dev)->internal);
+            if (!(iss && iss->read_protected && iss->read_fault_noted))
+                fprintf(stderr, "Fault writing memory (DMABSTRACTS = %08x) (%s) DMSTATUS: %08x\n", rrv, errortext, temp);
+            if (iss && iss->read_protected) iss->read_fault_noted = 1;
         }
         MCF.WriteReg32(dev, DMABSTRACTCS, 0x00000700);
         return -9;
@@ -1370,7 +1429,8 @@ static int DefaultReadWord(void *dev, uint32_t address_to_read, uint32_t *data) 
         iss->currentstateval = address_to_read;
 
         r |= MCF.WaitForDoneOp(dev, 0);
-        if (r) fprintf(stderr, "Fault on DefaultReadWord Part 1\n");
+        if (r && !(iss->read_protected && iss->read_fault_noted))
+            fprintf(stderr, "Fault on DefaultReadWord Part 1\n");
     }
 
     if (iss->autoincrement) iss->currentstateval += 4;
@@ -1478,10 +1538,13 @@ int DefaultReadBinaryBlob(void *dev, uint32_t address_to_read_from, uint32_t rea
         int remain = rend - rpos;
 
         if ((rpos & 3) == 0 && remain >= 4) {
-            uint32_t rw;
+            uint32_t rw = 0;
+            struct InternalState *iss = (struct InternalState *)(((struct ProgrammerStructBase *)dev)->internal);
             r = MCF.ReadWord(dev, rpos, &rw);
             // printf( "RW: %d %08x %08x\n", r, rpos, rw );
-            if (r) return r;
+            /* Readout protection faults the abstract command. Keep the
+             * data register anyway so the dump shows what the chip returned. */
+            if (r && !(iss && iss->read_protected)) return r;
             int rem = remain;
             if (rem > 4) rem = 4;
             memcpy(blob, &rw, rem);
@@ -1517,9 +1580,13 @@ int DefaultReadBinaryBlob(void *dev, uint32_t address_to_read_from, uint32_t rea
             }
         }
     }
-    int r = MCF.WaitForDoneOp(dev, 0);
-    if (r) fprintf(stderr, "Fault on DefaultReadBinaryBlob\n");
-    return r;
+    struct InternalState *iss = (struct InternalState *)(((struct ProgrammerStructBase *)dev)->internal);
+    int r = MCF.WaitForDoneOp(dev, iss && iss->read_protected);
+    if (r && !(iss && iss->read_protected)) {
+        fprintf(stderr, "Fault on DefaultReadBinaryBlob\n");
+        return r;
+    }
+    return 0;
 }
 
 int DefaultReadCPURegister(void *dev, uint32_t regno, uint32_t *regret) {

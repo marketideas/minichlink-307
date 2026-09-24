@@ -69,7 +69,7 @@ clean :
 # ── Same programmer targets as koin firmware/CH32 ─────────────────────────
 # Invokes this tree's ./minichlink-307 against the koin build products.
 # Does not configure or build the firmware.
-.PHONY: flash release_flash flash305 protect unprotect reset status swd readflash kill killocd killall help
+.PHONY: flash flash305 protect unprotect reset status swd readflash kill killocd killall help
 
 help:
 	@echo ""
@@ -89,7 +89,6 @@ help:
 	@echo "CH32V_SRAM_SIZE=$(CH32V_SRAM_SIZE)  APP_NAME=$(APP_NAME)  image=$(KOIN_BUILD_DIR)/$(APP_NAME).bin"
 	@echo ""
 	@echo "  flash                Attach, write the koin image, enable RDP if that build is Release, reboot"
-	@echo "  release_flash        Same as flash, and force readout protection on"
 	@echo "  flash305             Write tools/WCH-LinkE-APP-IAP.bin"
 	@echo "  protect              Enable readout protection and let the part run"
 	@echo "  unprotect            Disable readout protection (mass-erases application flash)"
@@ -119,11 +118,11 @@ flash: minichlink-307 killall
 	   $(PROGRAM) -b; \
 	 fi
 
-# Sets BUILD_TYPE=Release so the flash recipe enables readout protection.
-# Does not rebuild the koin firmware.
-release_flash: BUILD_TYPE = Release
-release_flash: flash
-	@echo "RELEASE flash complete (readout protection enabled)"
+flash305: minichlink-307 killall
+	@$(PROGRAM) -A
+	@$(PROGRAM) -w $(KOIN_CH32_TOOLS)/WCH-LinkE-APP-IAP.bin flash
+	@$(PROGRAM) -i
+	@$(PROGRAM) -b
 
 # Enable readout protection and let the part run. One invocation: a later
 # debug attach (the old trailing -b) asserts a hold that readout protection
@@ -137,12 +136,6 @@ unprotect: minichlink-307 killall
 	@echo "WARNING: disabling readout protection mass-erases application flash"
 	@$(PROGRAM) -A
 	@$(PROGRAM) -K $(CH32V_SRAM_SIZE) -p
-	@$(PROGRAM) -b
-
-flash305: minichlink-307 killall
-	@$(PROGRAM) -A
-	@$(PROGRAM) -w $(KOIN_CH32_TOOLS)/WCH-LinkE-APP-IAP.bin flash
-	@$(PROGRAM) -i
 	@$(PROGRAM) -b
 
 # Pin reset only. Does not attach, so a protected running image is not
@@ -160,8 +153,10 @@ status: minichlink-307 killall
 swd: minichlink-307 killall
 	@$(PROGRAM) -S
 
-# Read the start of application flash (vector table) over the debugger.
-# This uses the normal attach, including the reset retry. Hex goes to the console.
+# Read the start of application flash over the debugger. A protected chip
+# refuses the read outright (SWD is detected off and the tool bails out
+# without touching the part - no reset-line retry, no halt) rather than
+# risk wedging it; only unprotected chips actually return data.
 readflash: minichlink-307 killall
 	@$(PROGRAM) -r + flash 256
 

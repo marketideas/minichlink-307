@@ -64,7 +64,7 @@ static int checkChip(enum RiscVChip chip)
 }
 
 // For non-ch32v003 chips.
-// static int LEReadBinaryBlob( void * d, uint32_t offset, uint32_t amount, uint8_t * readbuff );
+static int __attribute__((unused)) LEReadBinaryBlob( void * d, uint32_t offset, uint32_t amount, uint8_t * readbuff );
 static int InternalLinkEHaltMode(void *d, int mode);
 static int LEWriteBinaryBlob(void *d, uint32_t address_to_write, uint32_t len, uint8_t *blob);
 
@@ -365,7 +365,14 @@ static int LESetupInterface(void *d)
 	}
 
 	/* 0x03 is the debug hold. On a protected part it survives 0xff until
-	 * power is cycled, so a pin reset must not take it. */
+	 * power is cycled, so a pin reset must not take it.
+	 *
+	 * Do NOT skip this for read_run (-r): status/protect/unprotect always
+	 * take it and reliably attach to an already-protected, running part.
+	 * Skipping it here (as this used to) leaves a protected/running part
+	 * wedged (unrecoverable without a power cycle) the moment SetupInterface
+	 * attaches - independent of anything the read command itself does
+	 * afterward. Confirmed by hardware testing. */
 	if (!iss->avoid_debug_hold)
 		wch_link_command(dev, "\x81\x0d\x01\x03", 4, (int *)&transferred, rbuff, 1024);
 
@@ -430,6 +437,40 @@ static int LESetupInterface(void *d)
 			{
 				fprintf(stderr, "SWD is off. Chip is running; not breaking in.\n");
 				iss->leave_running = 1;
+				iss->swd_off = 1;
+				return 0;
+			}
+
+			/* Same situation as protect_run above: SWD is off because a
+			 * protected image is running. The retry loop below repeatedly
+			 * pulses the reset line (\x13/\x14, up to 4x) trying to force
+			 * an attach - on real hardware that repeated reset-line
+			 * toggling while the protected firmware is mid-execution has
+			 * been confirmed to wedge the part in a way that survives a
+			 * later clean NRST pulse and requires a power cycle, even
+			 * though a single, non-retried status query (-i, taking the
+			 * no_attach_reset branch below) never does. So for reads,
+			 * bail out here exactly like -i does: query protection over
+			 * the still-responsive command channel (no debug attach
+			 * needed for this query) and refuse, without ever entering
+			 * the retry loop. */
+			if (iss->read_run)
+			{
+				uint8_t prbuf[16];
+				int pn = 0;
+				fprintf(stderr, "SWD is off. Chip is running; not breaking in to read.\n");
+				if (wch_link_command_try(dev, "\x81\x06\x01\x01", 4, &pn, prbuf, sizeof(prbuf)) == 0 && pn >= 4)
+				{
+					iss->read_protected = (prbuf[3] == 0x01);
+					fprintf(stderr, "Read protection: %s\n", iss->read_protected ? "enabled" : "disabled");
+				}
+				else
+				{
+					// Could not query status either; assume the worst so the read guard refuses.
+					iss->read_protected = 1;
+				}
+				iss->leave_running = 1;
+				iss->swd_off = 1;
 				return 0;
 			}
 
@@ -485,10 +526,17 @@ static int LESetupInterface(void *d)
 			MCF.DelayUS(iss, 5000);
 
 			wch_link_multicommands((libusb_device_handle *)dev, 1, 4, "\x81\x0d\x01\x14"); // Release reset line.
-			wch_link_multicommands(
-			    (libusb_device_handle *)dev, 3, 4, "\x81\x0b\x01\x01", 4, "\x81\x0d\x01\x02", 4, "\x81\x0d\x01\xff"
-			);
-			already_tried_reset++;
+			/* 0xff here freezes a halt until power is cycled. A flash
+			 * dump must not send it; pulse NRST and try the connect again. */
+			if (iss->read_run)
+				already_tried_reset++;
+			else
+			{
+				wch_link_multicommands(
+				    (libusb_device_handle *)dev, 3, 4, "\x81\x0b\x01\x01", 4, "\x81\x0d\x01\x02", 4, "\x81\x0d\x01\xff"
+				);
+				already_tried_reset++;
+			}
 		}
 		else
 		{
@@ -511,10 +559,21 @@ static int LESetupInterface(void *d)
 	{
 		fprintf(stderr, "Using binary blob write for operation.\n");
 		MCF.WriteBinaryBlob = LEWriteBinaryBlob;
+		/* LEReadBinaryBlob (native WCH-Link "Memory Read" command) is not
+		 * currently wired up: on this hardware it reliably times out
+		 * pulling data back on endpoint 0x82 (see the function's own
+		 * comment block for the protocol details that were verified
+		 * correct against the ch32-rs/wlink reference implementation -
+		 * the command bytes/sequence match, but something about the
+		 * bulk data pull doesn't work on this probe/firmware
+		 * combination). Falling back to the default DM abstract-command
+		 * (c.lw) ReadBinaryBlob, which is confirmed working for
+		 * unprotected reads. Protected reads never reach here at all -
+		 * see the guard in minichlink.c's case 'r'. */
 
 		iss->sector_size = 256;
 
-		if (!iss->hardware_reset && !iss->avoid_debug_hold)
+		if (!iss->hardware_reset && !iss->avoid_debug_hold && !iss->read_run)
 			wch_link_command(
 			    dev, "\x81\x0d\x01\x03", 4, (int *)&transferred, rbuff, 1024
 			);
@@ -553,7 +612,8 @@ static int LESetupInterface(void *d)
 	}
 	else
 	{
-		iss->reset_attached = 1;
+		if (iss->hardware_reset)
+			iss->reset_attached = 1;
 		fprintf(stderr, "Setup success\n");
 	}
 
@@ -1008,12 +1068,29 @@ static int InternalLinkEHaltMode(void *d, int mode)
 	return 0;
 }
 
-#if 0
+/* Uses the WCH-Link's own native "Memory Read" command (protocol CMD 0x03,
+ * documented in https://github.com/ch32-rs/wlink/blob/main/protocol.md and
+ * src/operations.rs/src/probe.rs in that same project) instead of executing
+ * c.lw instructions on the target CPU via the DM program buffer (what
+ * DefaultReadBinaryBlob/DefaultReadWord do). The reference implementation's
+ * read_memory() is documented "require MCU to be halted" - a normal RISC-V
+ * DM haltreq halt (DMCONTROL, same as MCF.HaltMode/HALT_MODE_HALT_BUT_NO_RESET),
+ * NOT the WCH pin-level hardware reset-hold InternalLinkEHaltMode() performs
+ * (that call was tried here previously and is the wrong mechanism - do not
+ * add it back). The caller (case 'r' in minichlink.c) already halts via
+ * MCF.HaltMode before calling this. Per that same protocol doc, CMD 0x06/0x01
+ * ("Flash Read Protect: check") documents that when protected, "read-memory
+ * return random data" - i.e. once halted, this specific command is safe to
+ * call regardless of protection state: it does not execute any instructions
+ * on the (halted) CPU, so it can't trip the DMABSTRACTCS exception that a
+ * DM abstract-command c.lw load against protected flash does (which,
+ * confirmed via repeated hardware testing, wedges this part in a way only a
+ * power-on reset clears). Data comes back on the same raw bulk endpoint
+ * (0x02 OUT / 0x82 IN) LEWriteBinaryBlob already uses to stream flash-write
+ * payloads. */
 static int LEReadBinaryBlob( void * d, uint32_t offset, uint32_t amount, uint8_t * readbuff )
 {
 	libusb_device_handle * dev = ((struct LinkEProgrammerStruct*)d)->devh;
-
-	InternalLinkEHaltMode( d, 0 );
 
 	int i;
 	int status;
@@ -1026,9 +1103,7 @@ static int LEReadBinaryBlob( void * d, uint32_t offset, uint32_t amount, uint8_t
 	// Flush out any pending data.
 	libusb_bulk_transfer( (libusb_device_handle *)dev, 0x82, rbuff, 1024, &transferred, 1 );
 
-	// 3/8 = Read Memory
-	// First 4 bytes are big-endian location.
-	// Next 4 bytes are big-endian amount.
+	// CMD 0x03 = Memory Read. Payload: offset:u32_be, len:u32_be.
 	uint8_t readop[11] = { 0x81, 0x03, 0x08, };
 
 	readop[3] = (offset>>24)&0xff;
@@ -1066,7 +1141,6 @@ static int LEReadBinaryBlob( void * d, uint32_t offset, uint32_t amount, uint8_t
 
 	return 0;
 }
-#endif
 
 static int LEWriteBinaryBlob(void *d, uint32_t address_to_write, uint32_t len, uint8_t *blob)
 {

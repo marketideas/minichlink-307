@@ -132,6 +132,11 @@ struct InternalState {
     int halt_cleared;           /* -P: DMSTATUS showed the hart running before detach */
     int leave_running;          /* -P saw SWD off: do not break in or reset */
     int protect_run;            /* -P: do not hold-and-retry if SWD is already off */
+    int read_run;               /* -r: do not take the sticky 0x03 debug hold */
+    int read_failed;            /* -r faulted; release the core on the way out */
+    int read_fault_noted;       /* printed the protected-read abstract fault once */
+    int swd_off;                /* connect failed; firmware is running with SWD disabled */
+    int redacted_flash;         /* -r hid internal flash because readout protection is on */
     int autoincrement;
     uint32_t ram_base;
     uint32_t ram_size;
